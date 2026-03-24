@@ -1,0 +1,625 @@
+"""
+excel_generator.py
+Génère un fichier Excel coloré et structuré à partir des données extraites par l'IA.
+"""
+import io
+from openpyxl import Workbook
+from openpyxl.styles import (
+    Font, PatternFill, Alignment, Border, Side, GradientFill
+)
+from openpyxl.utils import get_column_letter
+from openpyxl.chart import BarChart, Reference
+
+
+# ── Palette de couleurs ───────────────────────────────────────────────────────
+COLORS = {
+    "header_dark":   "1A3A5C",
+    "header_mid":    "2D6A9F",
+    "header_light":  "5B9BD5",
+    "actif":         "1565C0",
+    "passif":        "2E7D32",
+    "cpc_prod":      "F57F17",
+    "cpc_charge":    "B71C1C",
+    "tresorerie":    "6A1B9A",
+    "ratios_good":   "E8F5E9",
+    "ratios_warn":   "FFF3E0",
+    "ratios_bad":    "FFEBEE",
+    "row_even":      "F0F7FF",
+    "row_odd":       "FFFFFF",
+    "subtotal":      "E3F2FD",
+    "total":         "BBDEFB",
+    "white":         "FFFFFF",
+    "light_gray":    "F5F5F5",
+    "border":        "90A4AE",
+}
+
+THIN  = Side(style="thin",   color=COLORS["border"])
+MED   = Side(style="medium", color="455A64")
+BORDER_THIN = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
+BORDER_MED  = Border(left=MED,  right=MED,  top=MED,  bottom=MED)
+
+
+def _fill(hex_color: str) -> PatternFill:
+    return PatternFill("solid", fgColor=hex_color)
+
+
+def _font(bold=False, size=10, color="000000", italic=False) -> Font:
+    return Font(name="Calibri", bold=bold, size=size, color=color, italic=italic)
+
+
+def _align(h="left", v="center", wrap=False) -> Alignment:
+    return Alignment(horizontal=h, vertical=v, wrap_text=wrap)
+
+
+def _num(value):
+    """Return float or 0 safely."""
+    try:
+        return float(value) if value not in (None, "", "—") else 0.0
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _fmt_number(ws, cell_ref, value):
+    ws[cell_ref] = _num(value)
+    ws[cell_ref].number_format = '#,##0.00'
+
+
+# ── Sheet builders ─────────────────────────────────────────────────────────────
+
+def _add_sheet_header(ws, title: str, subtitle: str, color: str):
+    ws.merge_cells("A1:F1")
+    ws["A1"] = title
+    ws["A1"].font      = _font(bold=True, size=14, color="FFFFFF")
+    ws["A1"].fill      = _fill(color)
+    ws["A1"].alignment = _align("center")
+    ws["A1"].border    = BORDER_MED
+
+    ws.merge_cells("A2:F2")
+    ws["A2"] = subtitle
+    ws["A2"].font      = _font(size=10, color="FFFFFF", italic=True)
+    ws["A2"].fill      = _fill(COLORS["header_mid"])
+    ws["A2"].alignment = _align("center")
+    ws["A2"].border    = BORDER_THIN
+    ws.row_dimensions[1].height = 36
+    ws.row_dimensions[2].height = 20
+
+
+def _style_col_headers(ws, row: int, headers: list, color: str):
+    for col, h in enumerate(headers, start=1):
+        c = ws.cell(row=row, column=col, value=h)
+        c.font      = _font(bold=True, size=10, color="FFFFFF")
+        c.fill      = _fill(color)
+        c.alignment = _align("center")
+        c.border    = BORDER_THIN
+    ws.row_dimensions[row].height = 22
+
+
+def _style_data_row(ws, row: int, cols: int, even: bool, bold=False, fill_color=None):
+    fc = fill_color or (COLORS["row_even"] if even else COLORS["row_odd"])
+    for col in range(1, cols + 1):
+        c = ws.cell(row=row, column=col)
+        c.fill   = _fill(fc)
+        c.border = BORDER_THIN
+        if bold:
+            c.font = _font(bold=True, size=10)
+        else:
+            c.font = _font(size=10)
+        if col > 1:
+            c.alignment = _align("right")
+        else:
+            c.alignment = _align("left")
+
+
+# ─── 1. Bilan Actif ──────────────────────────────────────────────────────────
+
+def build_bilan_actif(wb, data: dict, entreprise: dict):
+    ws = wb.create_sheet("Bilan - Actif")
+    ws.sheet_properties.tabColor = COLORS["actif"]
+
+    _add_sheet_header(ws,
+        f"BILAN ACTIF — {entreprise.get('raison_sociale','')}",
+        f"Exercice : {entreprise.get('exercice','')}  |  IF : {entreprise.get('identifiant_fiscal','')}",
+        COLORS["header_dark"]
+    )
+
+    headers = ["POSTE", "BRUT (MAD)", "AMORT. & PROV.", "NET EXERCICE", "NET PRÉCÉDENT"]
+    _style_col_headers(ws, 3, headers, COLORS["actif"])
+
+    rows = data.get("bilan_actif", [])
+    sections = {
+        "immobilise":  ("ACTIF IMMOBILISÉ",  COLORS["header_light"]),
+        "circulant":   ("ACTIF CIRCULANT",   "27AE60"),
+        "tresorerie":  ("TRÉSORERIE ACTIF",  COLORS["tresorerie"]),
+    }
+
+    # Detect section keywords
+    def _section_key(poste: str) -> str:
+        p = poste.lower()
+        if any(k in p for k in ["immobil", "corporel", "incorporel", "financière", "non valeur"]):
+            return "immobilise"
+        if any(k in p for k in ["stock", "créance", "circulant", "client", "fournisseur débit"]):
+            return "circulant"
+        if any(k in p for k in ["trésorerie", "banque", "caisse", "chèque"]):
+            return "tresorerie"
+        return "other"
+
+    current_section = None
+    row_idx = 4
+    totals = {"brut": 0, "amort": 0, "net": 0, "net_prec": 0}
+
+    for i, item in enumerate(rows):
+        poste = str(item.get("poste", ""))
+        brut  = _num(item.get("brut", 0))
+        amort = _num(item.get("amortissements", 0))
+        net   = _num(item.get("net_exercice", 0))
+        prec  = _num(item.get("net_precedent", 0))
+
+        # Section header
+        sk = _section_key(poste)
+        if sk != "other" and sk != current_section:
+            current_section = sk
+            label, sec_color = sections.get(sk, ("", COLORS["header_mid"]))
+            ws.merge_cells(f"A{row_idx}:E{row_idx}")
+            c = ws[f"A{row_idx}"]
+            c.value     = label
+            c.font      = _font(bold=True, size=11, color="FFFFFF")
+            c.fill      = _fill(sec_color)
+            c.alignment = _align("left")
+            c.border    = BORDER_THIN
+            ws.row_dimensions[row_idx].height = 20
+            row_idx += 1
+
+        is_total = any(k in poste.upper() for k in ["TOTAL", "SOUS-TOTAL", "TOTAL GÉNÉRAL"])
+        even     = (i % 2 == 0)
+        fc       = COLORS["total"] if is_total else None
+
+        _style_data_row(ws, row_idx, 5, even, bold=is_total, fill_color=fc)
+
+        ws.cell(row=row_idx, column=1, value=poste)
+        for col, val in enumerate([brut, amort, net, prec], start=2):
+            cell = ws.cell(row=row_idx, column=col, value=val)
+            cell.number_format = '#,##0.00'
+            cell.alignment     = _align("right")
+
+        if is_total:
+            totals["brut"]  += brut
+            totals["amort"] += amort
+            totals["net"]   += net
+            totals["net_prec"] += prec
+
+        row_idx += 1
+
+    # Grand total row
+    row_idx += 1
+    _style_data_row(ws, row_idx, 5, False, bold=True, fill_color=COLORS["header_dark"])
+    ws.cell(row=row_idx, column=1, value="TOTAL GÉNÉRAL ACTIF").font = _font(bold=True, color="FFFFFF", size=11)
+    ws.cell(row=row_idx, column=1).fill = _fill(COLORS["header_dark"])
+    ws.cell(row=row_idx, column=1).alignment = _align("left")
+    for col in range(1, 6):
+        ws.cell(row=row_idx, column=col).font = _font(bold=True, color="FFFFFF", size=11)
+        ws.cell(row=row_idx, column=col).fill = _fill(COLORS["header_dark"])
+
+    # Column widths
+    ws.column_dimensions["A"].width = 45
+    for col in ["B", "C", "D", "E"]:
+        ws.column_dimensions[col].width = 18
+
+    # Freeze panes
+    ws.freeze_panes = "A4"
+    return ws
+
+
+# ─── 2. Bilan Passif ─────────────────────────────────────────────────────────
+
+def build_bilan_passif(wb, data: dict, entreprise: dict):
+    ws = wb.create_sheet("Bilan - Passif")
+    ws.sheet_properties.tabColor = COLORS["passif"]
+
+    _add_sheet_header(ws,
+        f"BILAN PASSIF — {entreprise.get('raison_sociale','')}",
+        f"Exercice : {entreprise.get('exercice','')}  |  IF : {entreprise.get('identifiant_fiscal','')}",
+        COLORS["passif"]
+    )
+
+    headers = ["POSTE", "EXERCICE (MAD)", "EXERCICE PRÉCÉDENT (MAD)"]
+    _style_col_headers(ws, 3, headers, COLORS["passif"])
+
+    rows = data.get("bilan_passif", [])
+
+    def _section_key_p(poste: str) -> str:
+        p = poste.lower()
+        if any(k in p for k in ["capital", "réserve", "résultat", "propre", "report"]):
+            return "cp"
+        if any(k in p for k in ["subvention", "provision réglementée", "assimilé"]):
+            return "cpa"
+        if any(k in p for k in ["emprunt", "dette financ", "financement"]):
+            return "df"
+        if any(k in p for k in ["fournisseur", "client créditeur", "personnel", "organisme", "état", "passif circulant", "créancier"]):
+            return "pc"
+        if "trésorerie" in p:
+            return "tp"
+        return "other"
+
+    section_labels = {
+        "cp":  ("CAPITAUX PROPRES",         "1565C0"),
+        "cpa": ("CAPITAUX PROPRES ASSIMILÉS","0288D1"),
+        "df":  ("DETTES DE FINANCEMENT",    "6A1B9A"),
+        "pc":  ("PASSIF CIRCULANT",         "E65100"),
+        "tp":  ("TRÉSORERIE PASSIF",        "4A148C"),
+    }
+
+    current_sec = None
+    row_idx = 4
+
+    for i, item in enumerate(rows):
+        poste = str(item.get("poste", ""))
+        exo   = _num(item.get("exercice", 0))
+        prec  = _num(item.get("precedent", 0))
+
+        sk = _section_key_p(poste)
+        if sk != "other" and sk != current_sec:
+            current_sec = sk
+            label, sec_color = section_labels.get(sk, ("", COLORS["header_mid"]))
+            ws.merge_cells(f"A{row_idx}:C{row_idx}")
+            c = ws[f"A{row_idx}"]
+            c.value     = label
+            c.font      = _font(bold=True, size=11, color="FFFFFF")
+            c.fill      = _fill(sec_color)
+            c.alignment = _align("left")
+            c.border    = BORDER_THIN
+            ws.row_dimensions[row_idx].height = 20
+            row_idx += 1
+
+        is_total = any(k in poste.upper() for k in ["TOTAL", "SOUS-TOTAL", "TOTAL GÉNÉRAL"])
+        even     = (i % 2 == 0)
+        fc       = COLORS["total"] if is_total else None
+
+        _style_data_row(ws, row_idx, 3, even, bold=is_total, fill_color=fc)
+        ws.cell(row=row_idx, column=1, value=poste)
+        for col, val in enumerate([exo, prec], start=2):
+            cell = ws.cell(row=row_idx, column=col, value=val)
+            cell.number_format = '#,##0.00'
+            cell.alignment     = _align("right")
+
+        row_idx += 1
+
+    ws.column_dimensions["A"].width = 45
+    ws.column_dimensions["B"].width = 22
+    ws.column_dimensions["C"].width = 22
+    ws.freeze_panes = "A4"
+    return ws
+
+
+# ─── 3. CPC ──────────────────────────────────────────────────────────────────
+
+def build_cpc(wb, data: dict, entreprise: dict):
+    ws = wb.create_sheet("CPC")
+    ws.sheet_properties.tabColor = COLORS["cpc_prod"]
+
+    _add_sheet_header(ws,
+        f"COMPTE DE PRODUITS ET CHARGES — {entreprise.get('raison_sociale','')}",
+        f"Exercice : {entreprise.get('exercice','')}",
+        "E65100"
+    )
+
+    headers = ["DÉSIGNATION", "EXERCICE (MAD)", "EXERCICE PRÉCÉDENT (MAD)", "VARIATION (MAD)", "VAR. %"]
+    _style_col_headers(ws, 3, headers, "BF360C")
+
+    rows = data.get("cpc", [])
+
+    def _is_produit(designation: str) -> bool:
+        d = designation.lower()
+        return any(k in d for k in ["produit", "chiffre d'affaires", "subvention d'exploitation",
+                                     "reprise", "vente"])
+
+    def _is_charge(designation: str) -> bool:
+        d = designation.lower()
+        return any(k in d for k in ["charge", "achat", "impôt", "dotation", "personnel", "intérêt"])
+
+    def _is_result(designation: str) -> bool:
+        d = designation.lower()
+        return any(k in d for k in ["résultat", "total"])
+
+    row_idx = 4
+    for i, item in enumerate(rows):
+        desig = str(item.get("designation", ""))
+        exo   = _num(item.get("exercice", 0))
+        prec  = _num(item.get("precedent", 0))
+        delta = exo - prec
+        pct   = (delta / prec * 100) if prec != 0 else 0
+
+        is_total = _is_result(desig) or any(k in desig.upper() for k in ["TOTAL", "RÉSULTAT NET"])
+        is_prod  = _is_produit(desig) and not is_total
+        is_chg   = _is_charge(desig) and not is_total
+
+        if is_total:
+            fc = COLORS["total"]
+        elif is_prod:
+            fc = "E8F5E9"
+        elif is_chg:
+            fc = "FFEBEE"
+        else:
+            fc = COLORS["row_even"] if i % 2 == 0 else COLORS["row_odd"]
+
+        _style_data_row(ws, row_idx, 5, i % 2 == 0, bold=is_total, fill_color=fc)
+        ws.cell(row=row_idx, column=1, value=desig)
+
+        cell_exo = ws.cell(row=row_idx, column=2, value=exo)
+        cell_exo.number_format = '#,##0.00'
+        cell_exo.alignment     = _align("right")
+
+        cell_pre = ws.cell(row=row_idx, column=3, value=prec)
+        cell_pre.number_format = '#,##0.00'
+        cell_pre.alignment     = _align("right")
+
+        cell_del = ws.cell(row=row_idx, column=4, value=delta)
+        cell_del.number_format = '+#,##0.00;-#,##0.00;"-"'
+        cell_del.alignment     = _align("right")
+        cell_del.font          = _font(bold=is_total, color=("2E7D32" if delta >= 0 else "C62828"))
+
+        cell_pct = ws.cell(row=row_idx, column=5, value=pct / 100 if pct else 0)
+        cell_pct.number_format = '+0.00%;-0.00%;"-"'
+        cell_pct.alignment     = _align("right")
+        cell_pct.font          = _font(bold=is_total, color=("2E7D32" if delta >= 0 else "C62828"))
+
+        row_idx += 1
+
+    ws.column_dimensions["A"].width = 48
+    ws.column_dimensions["B"].width = 20
+    ws.column_dimensions["C"].width = 20
+    ws.column_dimensions["D"].width = 18
+    ws.column_dimensions["E"].width = 12
+    ws.freeze_panes = "A4"
+    return ws
+
+
+# ─── 4. Trésorerie ───────────────────────────────────────────────────────────
+
+def build_tresorerie(wb, data: dict, entreprise: dict):
+    ws = wb.create_sheet("Trésorerie")
+    ws.sheet_properties.tabColor = COLORS["tresorerie"]
+
+    _add_sheet_header(ws,
+        f"TRÉSORERIE — {entreprise.get('raison_sociale','')}",
+        f"Exercice : {entreprise.get('exercice','')}",
+        COLORS["tresorerie"]
+    )
+
+    treso = data.get("tresorerie", {})
+    actif = _num(treso.get("actif_tresorerie", 0))
+    passif = _num(treso.get("passif_tresorerie", 0))
+    nette = actif - passif
+
+    items = [
+        ("Trésorerie Actif",   actif,  COLORS["actif"]),
+        ("Trésorerie Passif",  passif, COLORS["cpc_charge"]),
+        ("Trésorerie Nette",   nette,  COLORS["passif"] if nette >= 0 else COLORS["cpc_charge"]),
+    ]
+
+    headers = ["INDICATEUR", "MONTANT (MAD)"]
+    _style_col_headers(ws, 3, headers, COLORS["tresorerie"])
+
+    for i, (label, val, color) in enumerate(items, start=4):
+        c_label = ws.cell(row=i, column=1, value=label)
+        c_label.font      = _font(bold=True, size=11, color="FFFFFF")
+        c_label.fill      = _fill(color)
+        c_label.alignment = _align("left")
+        c_label.border    = BORDER_THIN
+
+        c_val = ws.cell(row=i, column=2, value=val)
+        c_val.font          = _font(bold=True, size=12, color="FFFFFF")
+        c_val.fill          = _fill(color)
+        c_val.number_format = '#,##0.00'
+        c_val.alignment     = _align("right")
+        c_val.border        = BORDER_THIN
+        ws.row_dimensions[i].height = 30
+
+    ws.column_dimensions["A"].width = 30
+    ws.column_dimensions["B"].width = 22
+    return ws
+
+
+# ─── 5. Ratios ───────────────────────────────────────────────────────────────
+
+def build_ratios(wb, data: dict, entreprise: dict):
+    ws = wb.create_sheet("Ratios Financiers")
+    ws.sheet_properties.tabColor = "F57F17"
+
+    _add_sheet_header(ws,
+        f"RATIOS FINANCIERS — {entreprise.get('raison_sociale','')}",
+        f"Exercice : {entreprise.get('exercice','')}",
+        "F57F17"
+    )
+
+    headers = ["RATIO", "FORMULE", "VALEUR", "INTERPRÉTATION", "APPRÉCIATION"]
+    _style_col_headers(ws, 3, headers, "E65100")
+
+    ratios = data.get("ratios", [])
+
+    def _appreciation(ratio_name: str, val: float) -> tuple:
+        """Returns (label, fill_color)"""
+        n = ratio_name.lower()
+        if "liquidité" in n:
+            if val >= 1.5:   return "✅ Bonne", COLORS["ratios_good"]
+            if val >= 1.0:   return "⚠️ Correct", COLORS["ratios_warn"]
+            return "❌ Insuffisant", COLORS["ratios_bad"]
+        if "autonomie" in n or "rentabilité" in n:
+            if val >= 0.3:   return "✅ Bonne", COLORS["ratios_good"]
+            if val >= 0.1:   return "⚠️ Correct", COLORS["ratios_warn"]
+            return "❌ Faible", COLORS["ratios_bad"]
+        if "endettement" in n:
+            if val <= 1.0:   return "✅ Faible", COLORS["ratios_good"]
+            if val <= 2.0:   return "⚠️ Modéré", COLORS["ratios_warn"]
+            return "❌ Élevé", COLORS["ratios_bad"]
+        return "ℹ️ À analyser", COLORS["ratios_warn"]
+
+    for i, item in enumerate(ratios, start=4):
+        ratio_name = str(item.get("ratio", ""))
+        formule    = str(item.get("formule", ""))
+        val        = _num(item.get("valeur", 0))
+        interp     = str(item.get("interpretation", ""))
+        appre_label, appre_color = _appreciation(ratio_name, val)
+
+        even = (i % 2 == 0)
+        _style_data_row(ws, i, 5, even)
+
+        ws.cell(row=i, column=1, value=ratio_name).font = _font(bold=True, size=10)
+        ws.cell(row=i, column=2, value=formule).font    = _font(italic=True, size=9, color="546E7A")
+
+        c_val = ws.cell(row=i, column=3, value=val)
+        c_val.number_format = '0.00'
+        c_val.alignment     = _align("center")
+        c_val.font          = _font(bold=True, size=11)
+
+        ws.cell(row=i, column=4, value=interp).alignment = _align("left", wrap=True)
+
+        c_appre = ws.cell(row=i, column=5, value=appre_label)
+        c_appre.fill      = _fill(appre_color)
+        c_appre.alignment = _align("center")
+        c_appre.font      = _font(bold=True, size=10)
+
+        ws.row_dimensions[i].height = 28
+
+    ws.column_dimensions["A"].width = 30
+    ws.column_dimensions["B"].width = 35
+    ws.column_dimensions["C"].width = 12
+    ws.column_dimensions["D"].width = 40
+    ws.column_dimensions["E"].width = 18
+    ws.freeze_panes = "A4"
+    return ws
+
+
+# ─── 6. Synthèse Dashboard ───────────────────────────────────────────────────
+
+def build_synthese(wb, data: dict, entreprise: dict):
+    ws = wb.create_sheet("📊 Synthèse")
+    wb.active = ws  # make it the first visible sheet
+
+    _add_sheet_header(ws,
+        f"TABLEAU DE BORD FINANCIER — {entreprise.get('raison_sociale','')}",
+        f"Exercice {entreprise.get('exercice','')} clôturé le {entreprise.get('date_cloture','')}",
+        COLORS["header_dark"]
+    )
+
+    # ── KPIs ─────────────────────────────────────────────────────────────────
+    kpi_row = 4
+    ws.merge_cells(f"A{kpi_row}:F{kpi_row}")
+    c = ws[f"A{kpi_row}"]
+    c.value     = "INDICATEURS CLÉS"
+    c.font      = _font(bold=True, size=12, color="FFFFFF")
+    c.fill      = _fill(COLORS["header_mid"])
+    c.alignment = _align("center")
+    c.border    = BORDER_THIN
+    ws.row_dimensions[kpi_row].height = 22
+
+    # Pull key figures
+    cpc_rows    = {r["designation"]: _num(r.get("exercice", 0)) for r in data.get("cpc", [])}
+    bilan_rows  = {r["poste"]: _num(r.get("net_exercice", 0)) for r in data.get("bilan_actif", [])}
+    passif_rows = {r["poste"]: _num(r.get("exercice", 0)) for r in data.get("bilan_passif", [])}
+    treso_data  = data.get("tresorerie", {})
+
+    def _find(d: dict, *keywords):
+        for k in keywords:
+            for key, val in d.items():
+                if k.lower() in key.lower():
+                    return val
+        return 0
+
+    ca         = _find(cpc_rows, "chiffre d'affaires", "ventes")
+    res_net    = _find(cpc_rows, "résultat net")
+    total_actif = _find(bilan_rows, "total général", "total")
+    cap_propres = _find(passif_rows, "total des capitaux propres", "capitaux propres")
+    treso_nette = _num(treso_data.get("actif_tresorerie", 0)) - _num(treso_data.get("passif_tresorerie", 0))
+
+    kpis = [
+        ("💰 Chiffre d'Affaires",  ca,          COLORS["actif"],    "MAD"),
+        ("📈 Résultat Net",        res_net,      COLORS["passif"] if res_net >= 0 else "C62828", "MAD"),
+        ("🏦 Total Actif",         total_actif,  COLORS["header_mid"],    "MAD"),
+        ("🏛️ Capitaux Propres",    cap_propres,  "6A1B9A",           "MAD"),
+        ("💵 Trésorerie Nette",    treso_nette,  COLORS["passif"] if treso_nette >= 0 else "C62828", "MAD"),
+    ]
+
+    kpi_data_row = kpi_row + 2
+    for col, (label, val, color, unit) in enumerate(kpis, start=1):
+        # Label
+        lc = ws.cell(row=kpi_data_row, column=col, value=label)
+        lc.font      = _font(bold=True, size=9, color="FFFFFF")
+        lc.fill      = _fill(color)
+        lc.alignment = _align("center", wrap=True)
+        lc.border    = BORDER_MED
+        ws.row_dimensions[kpi_data_row].height = 30
+
+        # Value
+        vc = ws.cell(row=kpi_data_row + 1, column=col, value=val)
+        vc.font          = _font(bold=True, size=12)
+        vc.number_format = '#,##0.00'
+        vc.alignment     = _align("center")
+        vc.fill          = _fill(COLORS["row_even"])
+        vc.border        = BORDER_MED
+        ws.row_dimensions[kpi_data_row + 1].height = 28
+
+    for col in range(1, 6):
+        ws.column_dimensions[get_column_letter(col)].width = 22
+
+    # ── Ratios summary ────────────────────────────────────────────────────────
+    rat_row = kpi_data_row + 4
+    ws.merge_cells(f"A{rat_row}:E{rat_row}")
+    c = ws[f"A{rat_row}"]
+    c.value     = "RÉSUMÉ DES RATIOS"
+    c.font      = _font(bold=True, size=12, color="FFFFFF")
+    c.fill      = _fill("F57F17")
+    c.alignment = _align("center")
+    c.border    = BORDER_THIN
+    ws.row_dimensions[rat_row].height = 22
+
+    ratios = data.get("ratios", [])
+    for i, r in enumerate(ratios[:6], start=rat_row + 1):
+        val = _num(r.get("valeur", 0))
+        ws.cell(row=i, column=1, value=r.get("ratio", "")).font = _font(bold=True, size=10)
+        c_v = ws.cell(row=i, column=2, value=val)
+        c_v.number_format = '0.00'
+        c_v.font          = _font(bold=True, size=11)
+        c_v.alignment     = _align("center")
+        ws.cell(row=i, column=3, value=r.get("interpretation", "")).font = _font(size=9, italic=True)
+        for col in range(1, 4):
+            ws.cell(row=i, column=col).border = BORDER_THIN
+            ws.cell(row=i, column=col).fill   = _fill(COLORS["row_even"] if i % 2 == 0 else COLORS["row_odd"])
+        ws.row_dimensions[i].height = 22
+
+    ws.freeze_panes = "A4"
+    return ws
+
+
+# ─── Main entry point ─────────────────────────────────────────────────────────
+
+def generate_excel(data: dict, sections: list) -> bytes:
+    wb = Workbook()
+    # Remove default sheet
+    default = wb.active
+    wb.remove(default)
+
+    entreprise = data.get("entreprise", {})
+
+    # Always build synthèse first
+    build_synthese(wb, data, entreprise)
+
+    if "bilan_actif_passif" in sections:
+        if data.get("bilan_actif"):
+            build_bilan_actif(wb, data, entreprise)
+        if data.get("bilan_passif"):
+            build_bilan_passif(wb, data, entreprise)
+
+    if "cpc" in sections and data.get("cpc"):
+        build_cpc(wb, data, entreprise)
+
+    if "tresorerie" in sections and data.get("tresorerie"):
+        build_tresorerie(wb, data, entreprise)
+
+    if "ratios" in sections and data.get("ratios"):
+        build_ratios(wb, data, entreprise)
+
+    # Save to buffer
+    buffer = io.BytesIO()
+    wb.save(buffer)
+    buffer.seek(0)
+    return buffer.getvalue()
